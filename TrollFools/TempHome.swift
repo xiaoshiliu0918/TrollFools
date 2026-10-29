@@ -1273,6 +1273,8 @@ struct TempHomeView: View {
         @StateObject private var targetSelection = TargetSelection.shared
         @ObservedObject private var engine = ImportEngine.shared
         @State private var plugins: [URL] = []
+        @State private var groups: [(category: String, items: [StashManager.DeepItem])] = []
+        @State private var collapsed: Set<String> = []
         @State private var selected: Set<String> = []
 
         var body: some View {
@@ -1354,48 +1356,80 @@ struct TempHomeView: View {
                                 .padding(16)
                                 .liquidGlass()
                             } else {
-                                VStack(spacing: 0) {
-                                    ForEach(plugins, id: \.absoluteString) { url in
-                                        let isSelected = selected.contains(url.absoluteString)
-                                        Button {
-                                            if isSelected {
-                                                selected.remove(url.absoluteString)
-                                            } else {
-                                                selected.insert(url.absoluteString)
-                                            }
-                                        } label: {
-                                            HStack(spacing: 12) {
-                                                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                                                    .font(.system(size: 22))
-                                                    .foregroundColor(isSelected ? .orange : .secondary.opacity(0.5))
-                                                Image(systemName: "shippingbox.fill")
-                                                    .font(.system(size: 16))
-                                                    .foregroundColor(.orange)
-                                                VStack(alignment: .leading, spacing: 2) {
-                                                    Text(url.lastPathComponent)
-                                                        .font(.body)
-                                                        .fontWeight(.medium)
+                                // 按分类分组展示，与暂存箱一致；点分组标题展开/收起
+                                VStack(spacing: 12) {
+                                    ForEach(groups, id: \.category) { group in
+                                        VStack(spacing: 0) {
+                                            // 分组标题（可点折叠）
+                                            Button {
+                                                toggleCollapsed(group.category)
+                                            } label: {
+                                                HStack(spacing: 10) {
+                                                    Image(systemName: collapsed.contains(group.category) ? "chevron.right" : "chevron.down")
+                                                        .font(.caption.weight(.semibold))
+                                                        .foregroundColor(.secondary)
+                                                        .frame(width: 14)
+                                                    Image(systemName: "folder.fill")
+                                                        .font(.caption)
+                                                        .foregroundColor(.orange)
+                                                    Text(group.category)
+                                                        .font(.subheadline)
+                                                        .fontWeight(.semibold)
                                                         .foregroundColor(.primary)
-                                                        .lineLimit(1)
-                                                    let category = StashManager.category(ofPluginAt: url)
-                                                    Text(category == "未分类"
-                                                         ? url.pathExtension.uppercased()
-                                                         : "分类：\(category)")
+                                                    Spacer()
+                                                    Text("\(group.items.count) 个")
                                                         .font(.caption2)
                                                         .foregroundColor(.secondary)
                                                 }
-                                                Spacer()
+                                                .padding(.horizontal, 14)
+                                                .padding(.vertical, 12)
+                                                .contentShape(Rectangle())
                                             }
-                                            .padding(14)
+                                            .buttonStyle(PlainButtonStyle())
+
+                                            if !collapsed.contains(group.category) {
+                                                ForEach(Array(group.items.enumerated()), id: \.element.relPath) { index, item in
+                                                    let url = item.url
+                                                    let isSelected = selected.contains(url.absoluteString)
+                                                    Button {
+                                                        if isSelected {
+                                                            selected.remove(url.absoluteString)
+                                                        } else {
+                                                            selected.insert(url.absoluteString)
+                                                        }
+                                                    } label: {
+                                                        HStack(spacing: 12) {
+                                                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                                                .font(.system(size: 22))
+                                                                .foregroundColor(isSelected ? .orange : .secondary.opacity(0.5))
+                                                            Image(systemName: "shippingbox.fill")
+                                                                .font(.system(size: 16))
+                                                                .foregroundColor(.orange)
+                                                            VStack(alignment: .leading, spacing: 2) {
+                                                                Text(url.lastPathComponent)
+                                                                    .font(.body)
+                                                                    .fontWeight(.medium)
+                                                                    .foregroundColor(.primary)
+                                                                    .lineLimit(1)
+                                                                Text(url.pathExtension.uppercased())
+                                                                    .font(.caption2)
+                                                                    .foregroundColor(.secondary)
+                                                            }
+                                                            Spacer()
+                                                        }
+                                                        .padding(14)
+                                                    }
+                                                    .buttonStyle(PlainButtonStyle())
+                                                    if index < group.items.count - 1 {
+                                                        Divider()
+                                                            .padding(.leading, 16)
+                                                    }
+                                                }
+                                            }
                                         }
-                                        .buttonStyle(PlainButtonStyle())
-                                        if url != plugins.last {
-                                            Divider()
-                                                .padding(.leading, 16)
-                                        }
+                                        .liquidGlass()
                                     }
                                 }
-                                .liquidGlass()
                             }
 
                             // 注入按钮
@@ -1462,10 +1496,49 @@ struct TempHomeView: View {
                 .navigationBarTitleDisplayMode(.large)
                 .navigationTitle("注入")
                 .onAppear {
-                    plugins = StashManager.shared.listPluginItems().map { $0.url }
+                    reloadPlugins()
                 }
             }
             .navigationViewStyle(.stack)
+        }
+
+        // MARK: - 插件分组
+
+        private static let collapsedKey = "shiliu.injectCollapsed"
+
+        private func loadCollapsed() {
+            let arr = UserDefaults.standard.stringArray(forKey: Self.collapsedKey) ?? []
+            collapsed = Set(arr)
+        }
+
+        private func toggleCollapsed(_ category: String) {
+            if collapsed.contains(category) {
+                collapsed.remove(category)
+            } else {
+                collapsed.insert(category)
+            }
+            UserDefaults.standard.set(Array(collapsed), forKey: Self.collapsedKey)
+        }
+
+        /// 刷新插件列表：按分类分组（与暂存箱一致），同时维护全选用的扁平数组。
+        private func reloadPlugins() {
+            loadCollapsed()
+            let items = StashManager.shared.listPluginItems()
+            plugins = items.map { $0.url }
+
+            var byCategory: [String: [StashManager.DeepItem]] = [:]
+            for item in items {
+                let category = StashManager.category(ofPluginAt: item.url)
+                byCategory[category, default: []].append(item)
+            }
+            groups = byCategory
+                .sorted { lhs, rhs in
+                    if (lhs.key == "未分类") != (rhs.key == "未分类") {
+                        return rhs.key == "未分类" // 未分类永远排最后
+                    }
+                    return lhs.key.localizedStandardCompare(rhs.key) == .orderedAscending
+                }
+                .map { (category: $0.key, items: $0.value) }
         }
 
         private var canInject: Bool {
