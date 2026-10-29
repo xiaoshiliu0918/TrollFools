@@ -392,10 +392,20 @@ final class ImportEngine: ObservableObject {
 
     /// The user-visible import folder inside our own Documents, exposed via
     /// UIFileSharingEnabled so it shows up in the Files app
-    /// (文件 App → 我的 iPhone → 石榴动态注入 → 插件导入).
+    /// (固定路径：/var/mobile/Documents/插件导入).
     static var importFolderURL: URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        // 同 stashRootURL：必须解析符号链接，保证与枚举器路径形态一致
+        // 用户明确要求：导入文件夹固定为 /var/mobile/Documents/插件导入。
+        // TrollStore 环境下 app 以 mobile 身份运行，可直接读写该全局目录；
+        // 用户在文件 App / Filza 里往这里放插件、建分类文件夹，app 据此双向同步。
+        // 若该位置不可写（非 TrollStore 安装），退回应用沙盒 Documents/插件导入。
+        let fm = FileManager.default
+        let preferred = URL(fileURLWithPath: "/var/mobile/Documents/插件导入", isDirectory: true)
+            .resolvingSymlinksInPath()
+        try? fm.createDirectory(at: preferred, withIntermediateDirectories: true)
+        if fm.isWritableFile(atPath: preferred.path) {
+            return preferred
+        }
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return docs.appendingPathComponent("插件导入", isDirectory: true)
             .resolvingSymlinksInPath()
     }
@@ -1560,7 +1570,7 @@ struct StashView: View {
         List {
             Section(
                 header: Text("放置的 dylib 会永久保存在这里，直到你手动删除"),
-                footer: Text("「插件导入」文件夹与本暂存箱双向实时同步（含子文件夹）：在文件 App 里建分类文件夹（如 王者荣耀、地下城），暂存箱会同步出相同分组；在暂存箱删除也会同步删掉文件夹里的。两侧同名插件保留修改时间新的一方。重复副本（如 DNF(2).dylib）自动并入 DNF.dylib。分类文件夹仅用于归类，不影响一键启动匹配；只有 dylib / framework / bundle / zip / deb 会被当作插件，其他文件不会被同步进暂存箱。")
+                footer: Text("同步目录：/var/mobile/Documents/插件导入。该目录与本暂存箱双向实时同步（含子文件夹）：在里面放插件、建分类文件夹（如 王者荣耀、地下城），暂存箱同步出相同分组；在暂存箱删除也会同步删掉文件夹里的。两侧同名插件保留修改时间新的一方。重复副本（如 DNF(2).dylib）自动并入 DNF.dylib。分类文件夹仅用于归类，不影响一键启动匹配；只有 dylib / framework / bundle / zip / deb 会被当作插件，其他文件不会被同步进暂存箱。")
             ) {
                 if groups.isEmpty {
                     Text("暂无插件。把 dylib / framework / zip / deb 放进「插件导入」文件夹即可自动同步到这里。")
