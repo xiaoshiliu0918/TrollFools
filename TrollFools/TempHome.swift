@@ -54,7 +54,12 @@ final class StashManager {
     static let shared = StashManager()
 
     static var stashRootURL: URL {
+        // 必须解析符号链接：iOS 上 /var 是 /private/var 的软链，
+        // 目录枚举器返回的是 /private/var/... 形态；若根仍是 /var/...，
+        // "根前缀剔除"会错位，把绝对路径后缀（如 "ts/插件导入"、"s/Stash"）
+        // 当成相对路径 → 双向同步产生嵌套污染。
         URL(fileURLWithPath: "/var/mobile/Library/TrollFools/Stash")
+            .standardizedResolvingSymlinksInPath()
     }
 
     /// 导入结果：新导入 / 覆盖更新 / 同名同大小跳过。
@@ -213,9 +218,10 @@ final class StashManager {
 
     /// 递归列举目录下所有文件与子目录（跳过点文件），按相对路径排序。
     func listDeep(at root: URL? = nil) -> [DeepItem] {
-        let rootURL = root ?? Self.stashRootURL
+        let rootURL = (root ?? Self.stashRootURL).standardizedResolvingSymlinksInPath()
         ensureStash()
         let fm = FileManager.default
+        let rootPath = rootURL.path
         var result: [DeepItem] = []
         guard let enumerator = fm.enumerator(
             at: rootURL,
@@ -227,7 +233,15 @@ final class StashManager {
                 enumerator.skipDescendants()
                 continue
             }
-            let rel = String(url.path.dropFirst(rootURL.path.count + 1))
+            var path = url.path
+            if !path.hasPrefix(rootPath + "/") {
+                path = url.standardizedResolvingSymlinksInPath().path
+            }
+            guard path.hasPrefix(rootPath + "/") else {
+                enumerator.skipDescendants()
+                continue
+            }
+            let rel = String(path.dropFirst(rootPath.count + 1))
             if rel.isEmpty { continue }
             let isDir = ((try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory) ?? false
             result.append(DeepItem(relPath: rel, url: url, isDirectory: isDir))
@@ -257,9 +271,10 @@ final class StashManager {
 
     /// 某插件文件所属的分类名（暂存箱根下的第一级子文件夹名；根目录文件 = 未分类）。
     static func category(ofPluginAt url: URL) -> String {
-        let root = stashRootURL.path + "/"
-        guard url.path.hasPrefix(root) else { return "未分类" }
-        let rel = String(url.path.dropFirst(root.count))
+        let root = stashRootURL.standardizedResolvingSymlinksInPath().path + "/"
+        let path = url.standardizedResolvingSymlinksInPath().path
+        guard path.hasPrefix(root) else { return "未分类" }
+        let rel = String(path.dropFirst(root.count))
         let parts = rel.split(separator: "/")
         return parts.count > 1 ? String(parts[0]) : "未分类"
     }
@@ -380,7 +395,9 @@ final class ImportEngine: ObservableObject {
     /// (文件 App → 我的 iPhone → 石榴动态注入 → 插件导入).
     static var importFolderURL: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        // 同 stashRootURL：必须解析符号链接，保证与枚举器路径形态一致
         return docs.appendingPathComponent("插件导入", isDirectory: true)
+            .standardizedResolvingSymlinksInPath()
     }
 
     static func ensureImportFolder() {
@@ -409,10 +426,14 @@ final class ImportEngine: ObservableObject {
             let folderURL = Self.importFolderURL
             let stashURL = StashManager.stashRootURL
 
-            // 递归扫描一侧：返回 relPath → URL 的文件表 + 目录集合
-            func scan(_ root: URL) -> (files: [String: URL], dirs: Set<String>) {
+            // 递归扫描一侧：返回 relPath → URL 的文件表 + 目录集合。
+            // 双保险：枚举器返回的路径若与根前缀对不上（符号链接解析差异），
+            // 先尝试标准化对齐；仍对不上则连同子树整体跳过，绝不生成碎片相对路径。
+            func scan(_ root: URL, otherRoot: URL) -> (files: [String: URL], dirs: Set<String>) {
                 var files: [String: URL] = [:]
                 var dirs = Set<String>()
+                let rootPath = root.standardizedResolvingSymlinksInPath().path
+                let otherPath = otherRoot.standardizedResolvingSymlinksInPath().path
                 guard let enumerator = fm.enumerator(
                     at: root, includingPropertiesForKeys: [.isDirectoryKey]
                 ) else { return (files, dirs) }
@@ -422,7 +443,19 @@ final class ImportEngine: ObservableObject {
                         enumerator.skipDescendants()
                         continue
                     }
-                    let rel = String(url.path.dropFirst(root.path.count + 1))
+                    var path = url.path
+                    if !path.hasPrefix(rootPath + "/") {
+                        path = url.standardizedResolvingSymlinksInPath().path
+                    }
+                    guard path.hasPrefix(rootPath + "/") else {
+                        enumerator.skipDescendants() // 路径形态对不上：整棵子树跳过
+                        continue
+                    }
+                    if path.hasPrefix(otherPath + "/") {
+                        enumerator.skipDescendants() // 对端根嵌套在本端内：整体跳过，防止互拷
+                        continue
+                    }
+                    let rel = String(path.dropFirst(rootPath.count + 1))
                     if rel.isEmpty { continue }
                     let isDir = ((try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory) ?? false
                     if isDir { dirs.insert(rel) } else { files[rel] = url }
@@ -430,10 +463,42 @@ final class ImportEngine: ObservableObject {
                 return (files, dirs)
             }
 
-            let folderScan = scan(folderURL)
+            var folderScan = scan(folderURL, otherRoot: stashURL)
+            var stashScan = scan(stashURL, otherRoot: folderURL)
+
+            // ── Step A-：清理历史版本遗留的"相对路径碎片"污染 ──
+            // 症状：目录里出现 "ts/插件导入/…"、"s/Stash/…" 这类嵌套
+            // （绝对路径后缀被当成相对路径复制）。凡相对路径里含系统目录名
+            // 组件（插件导入/Documents/Library/TrollFools/Stash/…）即视为污染，
+            // 两侧一并删除；随后清空同步快照并重新扫描（快照为空只做补齐，不误删）。
+            let pollutionNames: Set<String> = [
+                "插件导入", "Documents", "Library", "TrollFools",
+                "Stash", "private", "var", "mobile",
+            ]
+            func isPolluted(_ rel: String) -> Bool {
+                rel.split(separator: "/").contains { pollutionNames.contains(String($0)) }
+            }
+            var cleanedCount = 0
+            for (rootURL, scanResult) in [(folderURL, folderScan), (stashURL, stashScan)] {
+                var removedPrefixes: [String] = []
+                for rel in (scanResult.files.keys + scanResult.dirs).sorted() {
+                    guard isPolluted(rel),
+                          !removedPrefixes.contains(where: { rel.hasPrefix($0 + "/") }) else { continue }
+                    try? fm.removeItem(at: rootURL.appendingPathComponent(rel))
+                    removedPrefixes.append(rel)
+                    cleanedCount += 1
+                }
+            }
+            if cleanedCount > 0 {
+                StashManager.mirrorSnapshot = []
+                self.log("🧹 已清理路径污染残留 \(cleanedCount) 项（历史版本相对路径错位导致）")
+                // 重新扫描，保证后续步骤基于干净状态
+                folderScan = scan(folderURL, otherRoot: stashURL)
+                stashScan = scan(stashURL, otherRoot: folderURL)
+            }
+
             var folderFiles = folderScan.files
             let folderDirs = folderScan.dirs
-            let stashScan = scan(stashURL)
             var stashFiles = stashScan.files
             let stashDirs = stashScan.dirs
 
