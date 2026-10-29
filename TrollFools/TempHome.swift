@@ -59,7 +59,7 @@ final class StashManager {
         // "根前缀剔除"会错位，把绝对路径后缀（如 "ts/插件导入"、"s/Stash"）
         // 当成相对路径 → 双向同步产生嵌套污染。
         URL(fileURLWithPath: "/var/mobile/Library/TrollFools/Stash")
-            .standardizedResolvingSymlinksInPath()
+            .resolvingSymlinksInPath()
     }
 
     /// 导入结果：新导入 / 覆盖更新 / 同名同大小跳过。
@@ -218,7 +218,7 @@ final class StashManager {
 
     /// 递归列举目录下所有文件与子目录（跳过点文件），按相对路径排序。
     func listDeep(at root: URL? = nil) -> [DeepItem] {
-        let rootURL = (root ?? Self.stashRootURL).standardizedResolvingSymlinksInPath()
+        let rootURL = (root ?? Self.stashRootURL).resolvingSymlinksInPath()
         ensureStash()
         let fm = FileManager.default
         let rootPath = rootURL.path
@@ -235,7 +235,7 @@ final class StashManager {
             }
             var path = url.path
             if !path.hasPrefix(rootPath + "/") {
-                path = url.standardizedResolvingSymlinksInPath().path
+                path = url.resolvingSymlinksInPath().path
             }
             guard path.hasPrefix(rootPath + "/") else {
                 enumerator.skipDescendants()
@@ -271,8 +271,8 @@ final class StashManager {
 
     /// 某插件文件所属的分类名（暂存箱根下的第一级子文件夹名；根目录文件 = 未分类）。
     static func category(ofPluginAt url: URL) -> String {
-        let root = stashRootURL.standardizedResolvingSymlinksInPath().path + "/"
-        let path = url.standardizedResolvingSymlinksInPath().path
+        let root = stashRootURL.resolvingSymlinksInPath().path + "/"
+        let path = url.resolvingSymlinksInPath().path
         guard path.hasPrefix(root) else { return "未分类" }
         let rel = String(path.dropFirst(root.count))
         let parts = rel.split(separator: "/")
@@ -397,7 +397,7 @@ final class ImportEngine: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         // 同 stashRootURL：必须解析符号链接，保证与枚举器路径形态一致
         return docs.appendingPathComponent("插件导入", isDirectory: true)
-            .standardizedResolvingSymlinksInPath()
+            .resolvingSymlinksInPath()
     }
 
     static func ensureImportFolder() {
@@ -432,8 +432,8 @@ final class ImportEngine: ObservableObject {
             func scan(_ root: URL, otherRoot: URL) -> (files: [String: URL], dirs: Set<String>) {
                 var files: [String: URL] = [:]
                 var dirs = Set<String>()
-                let rootPath = root.standardizedResolvingSymlinksInPath().path
-                let otherPath = otherRoot.standardizedResolvingSymlinksInPath().path
+                let rootPath = root.resolvingSymlinksInPath().path
+                let otherPath = otherRoot.resolvingSymlinksInPath().path
                 guard let enumerator = fm.enumerator(
                     at: root, includingPropertiesForKeys: [.isDirectoryKey]
                 ) else { return (files, dirs) }
@@ -445,7 +445,7 @@ final class ImportEngine: ObservableObject {
                     }
                     var path = url.path
                     if !path.hasPrefix(rootPath + "/") {
-                        path = url.standardizedResolvingSymlinksInPath().path
+                        path = url.resolvingSymlinksInPath().path
                     }
                     guard path.hasPrefix(rootPath + "/") else {
                         enumerator.skipDescendants() // 路径形态对不上：整棵子树跳过
@@ -481,7 +481,7 @@ final class ImportEngine: ObservableObject {
             var cleanedCount = 0
             for (rootURL, scanResult) in [(folderURL, folderScan), (stashURL, stashScan)] {
                 var removedPrefixes: [String] = []
-                for rel in (scanResult.files.keys + scanResult.dirs).sorted() {
+                for rel in Set(scanResult.files.keys).union(scanResult.dirs).sorted() {
                     guard isPolluted(rel),
                           !removedPrefixes.contains(where: { rel.hasPrefix($0 + "/") }) else { continue }
                     try? fm.removeItem(at: rootURL.appendingPathComponent(rel))
