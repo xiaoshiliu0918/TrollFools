@@ -71,18 +71,6 @@ final class StashManager {
 
     // MARK: 双向镜像快照
     // 「插件导入」文件夹 ⇄ 暂存箱 双向同步的状态依据：
-    // 记录上一轮同步结束时两边共有的文件名集合。
-    // - 某名字上一轮两边都有、这一轮只在文件夹 → 用户在文件夹删除了 → 同步删除暂存箱
-    // - 某名字上一轮两边都有、这一轮只在暂存箱 → 用户在 app 删除了 → 同步删除文件夹
-    // - 某名字只在单侧且不在快照里 → 新增 → 同步到另一侧
-
-    private static let mirrorSnapshotKey = "shiliu.mirrorSnapshot"
-
-    static var mirrorSnapshot: Set<String> {
-        get { Set(UserDefaults.standard.stringArray(forKey: mirrorSnapshotKey) ?? []) }
-        set { UserDefaults.standard.set(Array(newValue), forKey: mirrorSnapshotKey) }
-    }
-
     /// iOS 文件 App 复制重名文件时会自动生成 "Name (2).ext" / "Name(2).ext"。
     /// 把这类名字折叠回 "Name.ext"，避免同一插件因重复复制产生多个副本。
     static func normalizedPluginName(_ rawName: String) -> String {
@@ -202,8 +190,18 @@ final class StashManager {
 
     /// 从暂存箱删除插件。
     /// 「插件导入」文件夹里的同名文件由双向同步负责删除。
+    /// 从暂存箱删除插件。暂存箱是「插件导入」文件夹的单向镜像，
+    /// 因此同时删除文件夹里的对应文件（同相对路径），否则下次同步又会被收回来。
     func removePlugin(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
+        let root = Self.stashRootURL.resolvingSymlinksInPath().path + "/"
+        let path = url.resolvingSymlinksInPath().path
+        guard path.hasPrefix(root) else { return }
+        let rel = String(path.dropFirst(root.count))
+        let mirror = ImportEngine.importFolderURL.appendingPathComponent(rel)
+        if FileManager.default.fileExists(atPath: mirror.path) {
+            try? FileManager.default.removeItem(at: mirror)
+        }
     }
 
     // MARK: 深度列举（支持子文件夹分类）
@@ -350,18 +348,32 @@ final class ImportEngine: ObservableObject {
             var ok: [String] = []
             var skipped: [String] = []
             var failures: [String] = []
+            let fm = FileManager.default
             for url in urls {
                 do {
-                    let (name, outcome) = try StashManager.shared.importPluginDedup(from: url)
-                    switch outcome {
-                    case .imported, .updated:
-                        ok.append(name)
-                    case .skipped:
-                        skipped.append(name)
+                    // 一切以「插件导入」文件夹为准：外部导入（共享接收等）
+                    // 先落进导入文件夹，再由单向同步收进暂存箱
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    let name = StashManager.normalizedPluginName(url.lastPathComponent)
+                    let dst = Self.importFolderURL.appendingPathComponent(name)
+                    if fm.fileExists(atPath: dst.path) {
+                        let oldSize = StashManager.fileSize(of: dst)
+                        let newSize = StashManager.fileSize(of: url)
+                        if oldSize >= 0, oldSize == newSize {
+                            skipped.append(name)
+                            continue
+                        }
+                        try? fm.removeItem(at: dst)
                     }
+                    try fm.copyItem(at: url, to: dst)
+                    ok.append(name)
                 } catch {
                     failures.append("\(url.lastPathComponent)\n\(error.localizedDescription)")
                 }
+            }
+            if !ok.isEmpty || !skipped.isEmpty {
+                self.syncImportFolder()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 for name in ok {
@@ -416,16 +428,14 @@ final class ImportEngine: ObservableObject {
         )
     }
 
-    /// 「插件导入」文件夹 ⇄ 暂存箱 双向镜像同步（递归，支持子文件夹分类）。
-    /// 用户在导入文件夹内自建分类文件夹（王者荣耀 / 地下城 / 抖音…），
-    /// 暂存箱内保持完全一致的目录结构，反之亦然。
-    /// - 文件/目录双向新增：单侧存在的同步到另一侧
-    /// - 文件/目录双向删除：以**上一轮同步快照**（UserDefaults `shiliu.mirrorSnapshot`）
-    ///   为删除判定依据——上一轮两边都有、这一轮只剩一侧 → 判定为用户删除 → 同步删除另一侧；
-    ///   首次运行快照为空，只做增量补齐，**绝不误删**
-    /// - 两侧同名但大小不同 → 修改时间较新的一侧覆盖较旧的一侧
+    /// 「插件导入」文件夹 → 暂存箱 **单向**镜像同步（递归，支持子文件夹分类）。
+    /// ★ 一切以 /var/mobile/Documents/插件导入 为准：
+    ///   - 文件夹里有 → 暂存箱必须有（内容不同以文件夹覆盖）
+    ///   - 文件夹里没有 → 暂存箱删除（app 内的内容绝不回灌进文件夹）
+    ///   - 文件夹里的分类目录 → 暂存箱同步创建（空分类也建）
+    /// - 只同步插件类型（dylib/zip/deb 文件与 .framework/.bundle 目录）
     /// - 文件 App 复制副本 "DNF(2).dylib" 自动并入正本 "DNF.dylib"（按目录内处理）
-    /// - force = true（手动按钮）：忽略快照，按"恢复"语义补齐两侧缺失的内容
+    /// - force = true（手动按钮）：忽略大小比对，全部重新复制一遍
     func syncImportFolder(force: Bool = false) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -500,7 +510,6 @@ final class ImportEngine: ObservableObject {
                 }
             }
             if cleanedCount > 0 {
-                StashManager.mirrorSnapshot = []
                 self.log("🧹 已清理路径污染残留 \(cleanedCount) 项（历史版本相对路径错位导致）")
                 // 重新扫描，保证后续步骤基于干净状态
                 folderScan = scan(folderURL, otherRoot: stashURL)
@@ -556,103 +565,54 @@ final class ImportEngine: ObservableObject {
                 }
             }
 
-            // ── Step B：按相对路径双向对齐（先文件后目录）──
-            let previous = StashManager.mirrorSnapshot
-            var current = Set<String>()
+            // ── Step B：单向镜像——一切以「插件导入」文件夹为准 ──
             var imported: [String] = []
             var updated: [String] = []
             var removed: [String] = []
 
-            for rel in Set(folderFiles.keys).union(stashFiles.keys).sorted() {
-                current.insert(rel)
-                let f = folderFiles[rel]
-                let s = stashFiles[rel]
-
-                switch (f, s) {
-                case let (folderFile?, nil):
-                    // 只在文件夹里
-                    if previous.contains(rel), !force {
-                        // 上一轮两边都有 → 用户在文件夹删除了 → 同步删除暂存箱
-                        try? fm.removeItem(at: stashURL.appendingPathComponent(rel))
-                        removed.append(rel)
-                    } else {
-                        // 新文件 → 收进暂存箱（含父目录创建）
-                        let dst = stashURL.appendingPathComponent(rel)
-                        try? fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        do {
-                            if fm.fileExists(atPath: dst.path) { try? fm.removeItem(at: dst) }
-                            try fm.copyItem(at: folderFile, to: dst)
-                            imported.append(rel)
-                        } catch {
-                            self.log("❌ 导入文件夹：\(rel) \(error.localizedDescription)")
-                        }
-                    }
-
-                case let (nil, stashFile?):
-                    // 只在暂存箱里
-                    if previous.contains(rel), !force {
-                        // 上一轮两边都有 → 用户在 app 暂存箱删除了 → 同步删除文件夹文件
-                        try? fm.removeItem(at: folderURL.appendingPathComponent(rel))
-                        removed.append(rel)
-                    } else {
-                        // 暂存箱新增（文件选择/共享/扫描导入）→ 镜像进文件夹
-                        let dst = folderURL.appendingPathComponent(rel)
-                        try? fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        do {
-                            if fm.fileExists(atPath: dst.path) { try? fm.removeItem(at: dst) }
-                            try fm.copyItem(at: stashFile, to: dst)
-                            imported.append(rel)
-                        } catch {
-                            self.log("❌ 同步到导入文件夹：\(rel) \(error.localizedDescription)")
-                        }
-                    }
-
-                case let (folderFile?, stashFile?):
-                    // 两边都有：大小一致 → 已同步
-                    let fs = StashManager.fileSize(of: folderFile)
-                    let ss = StashManager.fileSize(of: stashFile)
-                    if fs >= 0, fs == ss { continue }
-                    // 大小不同：修改时间较新的一侧胜出
-                    let fd = StashManager.modificationDate(of: folderFile) ?? .distantPast
-                    let sd = StashManager.modificationDate(of: stashFile) ?? .distantPast
-                    do {
-                        if fd > sd {
-                            try? fm.removeItem(at: stashFile)
-                            try fm.copyItem(at: folderFile, to: stashFile)
-                        } else {
-                            try? fm.removeItem(at: folderFile)
-                            try fm.copyItem(at: stashFile, to: folderFile)
-                        }
-                        updated.append(rel)
-                    } catch {
-                        self.log("❌ 同步冲突：\(rel) \(error.localizedDescription)")
-                    }
-
-                case (nil, nil):
-                    break
-                }
-            }
-
-            // 目录对齐（文件处理完再动目录，保证"整目录删除"时内容已先清掉）
-            for rel in folderDirs.union(stashDirs).sorted() {
-                current.insert(rel)
-                let inFolder = folderDirs.contains(rel)
-                let inStash = stashDirs.contains(rel)
-                guard inFolder != inStash else { continue }
-                let other = inFolder
-                    ? stashURL.appendingPathComponent(rel, isDirectory: true)
-                    : folderURL.appendingPathComponent(rel, isDirectory: true)
-                if previous.contains(rel), !force {
-                    // 目录被删除 → 删除另一侧（此时应为空目录）
-                    try? fm.removeItem(at: other)
-                    removed.append(rel)
+            for rel in folderFiles.keys.sorted() {
+                let src = folderFiles[rel]!
+                let dst = stashURL.appendingPathComponent(rel)
+                let existing = stashFiles[rel]
+                let needCopy: Bool
+                if let s = existing {
+                    let fs = StashManager.fileSize(of: src)
+                    let ss = StashManager.fileSize(of: s)
+                    needCopy = force || fs < 0 || fs != ss
                 } else {
-                    // 新目录 → 另一侧创建（空分类也会同步过去）
-                    try? fm.createDirectory(at: other, withIntermediateDirectories: true)
+                    needCopy = true
+                }
+                guard needCopy else { continue }
+                do {
+                    try? fm.createDirectory(
+                        at: dst.deletingLastPathComponent(), withIntermediateDirectories: true
+                    )
+                    if fm.fileExists(atPath: dst.path) { try? fm.removeItem(at: dst) }
+                    try fm.copyItem(at: src, to: dst)
+                    if existing == nil { imported.append(rel) } else { updated.append(rel) }
+                } catch {
+                    self.log("❌ 同步：\(rel) \(error.localizedDescription)")
                 }
             }
 
-            StashManager.mirrorSnapshot = current
+            // 暂存箱里多出来的文件 = 文件夹里已不存在 → 删除（以文件夹为准，不回灌）
+            for rel in stashFiles.keys where folderFiles[rel] == nil {
+                try? fm.removeItem(at: stashURL.appendingPathComponent(rel))
+                removed.append(rel)
+            }
+
+            // 目录对齐：文件夹里的目录 → 暂存箱同步创建（空分类也建）；
+            // 暂存箱多出来的目录（含残留空分类）→ 删除
+            for rel in folderDirs.sorted() {
+                let dst = stashURL.appendingPathComponent(rel, isDirectory: true)
+                if !fm.fileExists(atPath: dst.path) {
+                    try? fm.createDirectory(at: dst, withIntermediateDirectories: true)
+                }
+            }
+            for rel in stashDirs.sorted() where !folderDirs.contains(rel) {
+                // 其内容已在上一步按文件级清空，这里移除目录本身
+                try? fm.removeItem(at: stashURL.appendingPathComponent(rel, isDirectory: true))
+            }
 
             if !imported.isEmpty || !updated.isEmpty || !removed.isEmpty {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
@@ -1561,6 +1521,7 @@ struct StashView: View {
 
     @ObservedObject private var engine = ImportEngine.shared
     @State private var groups: [(category: String, items: [StashManager.DeepItem])] = []
+    @State private var collapsed: Set<String> = []
     @State private var isCreateCategoryPresented = false
     @State private var newCategoryName = ""
 
@@ -1569,8 +1530,8 @@ struct StashView: View {
     var body: some View {
         List {
             Section(
-                header: Text("放置的 dylib 会永久保存在这里，直到你手动删除"),
-                footer: Text("同步目录：/var/mobile/Documents/插件导入。该目录与本暂存箱双向实时同步（含子文件夹）：在里面放插件、建分类文件夹（如 王者荣耀、地下城），暂存箱同步出相同分组；在暂存箱删除也会同步删掉文件夹里的。两侧同名插件保留修改时间新的一方。重复副本（如 DNF(2).dylib）自动并入 DNF.dylib。分类文件夹仅用于归类，不影响一键启动匹配；只有 dylib / framework / bundle / zip / deb 会被当作插件，其他文件不会被同步进暂存箱。")
+                header: Text("暂存箱 = 「插件导入」文件夹的实时镜像"),
+                footer: Text("同步目录：/var/mobile/Documents/插件导入（唯一权威）。app 每次刷新都按该目录镜像：文件夹里有什么，这里就显示什么；文件夹里删了，这里跟着删；文件夹里更新了，这里跟着更新。app 内的任何内容都不会被回灌进文件夹。点分组标题可展开/收起。在 app 内删除插件会同时删掉文件夹里的对应文件。只有 dylib / framework / bundle / zip / deb 会被当作插件；重复副本（如 DNF(2).dylib）自动并入 DNF.dylib。")
             ) {
                 if groups.isEmpty {
                     Text("暂无插件。把 dylib / framework / zip / deb 放进「插件导入」文件夹即可自动同步到这里。")
@@ -1579,32 +1540,44 @@ struct StashView: View {
                 } else {
                     ForEach(groups, id: \.category) { group in
                         Section(
-                            header: HStack {
-                                Image(systemName: "folder.fill")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                                Text(group.category == "未分类" ? "未分类" : group.category)
-                                    .font(.footnote)
-                                Spacer()
-                                Text("\(group.items.count) 个")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        ) {
-                            ForEach(group.items, id: \.relPath) { item in
+                            header: Button {
+                                toggleCollapsed(group.category)
+                            } label: {
                                 HStack {
-                                    Image(systemName: "shippingbox.fill")
+                                    Image(systemName: collapsed.contains(group.category) ? "chevron.right" : "chevron.down")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 14)
+                                    Image(systemName: "folder.fill")
+                                        .font(.caption)
                                         .foregroundColor(.orange)
-                                    Text(item.url.lastPathComponent)
-                                        .font(.subheadline)
-                                        .lineLimit(1)
+                                    Text(group.category)
+                                        .font(.footnote)
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    Text("\(group.items.count) 个")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
                                 }
                             }
-                            .onDelete { indexSet in
-                                for index in indexSet {
-                                    stash.removePlugin(group.items[index].url)
+                            .buttonStyle(.plain)
+                        ) {
+                            if !collapsed.contains(group.category) {
+                                ForEach(group.items, id: \.relPath) { item in
+                                    HStack {
+                                        Image(systemName: "shippingbox.fill")
+                                            .foregroundColor(.orange)
+                                        Text(item.url.lastPathComponent)
+                                            .font(.subheadline)
+                                            .lineLimit(1)
+                                    }
                                 }
-                                reload()
+                                .onDelete { indexSet in
+                                    for index in indexSet {
+                                        stash.removePlugin(group.items[index].url)
+                                    }
+                                    reload()
+                                }
                             }
                         }
                     }
@@ -1615,7 +1588,7 @@ struct StashView: View {
                 Button {
                     ImportEngine.shared.syncImportFolder(force: true)
                 } label: {
-                    Label("立即同步（导入文件夹 ⇄ 暂存箱）", systemImage: "arrow.left.arrow.right")
+                    Label("立即同步（以插件导入文件夹为准）", systemImage: "arrow.triangle.2.circlepath")
                 }
 
                 Button {
@@ -1639,6 +1612,7 @@ struct StashView: View {
         .listStyle(.insetGrouped)
         .navigationTitle("暂存箱")
         .onAppear {
+            loadCollapsed()
             reload()
             ImportEngine.shared.syncImportFolder()
         }
@@ -1651,7 +1625,7 @@ struct StashView: View {
         .sheet(isPresented: $isCreateCategoryPresented) {
             NavigationView {
                 Form {
-                    Section(footer: Text("分类文件夹会在「插件导入」目录和暂存箱同步创建，之后在文件 App 里把对应 dylib 拖进去即可自动归类。")) {
+                    Section(footer: Text("分类文件夹会在 /var/mobile/Documents/插件导入 目录下创建（暂存箱同步出现），之后把对应 dylib 拖进该文件夹即可自动归类。")) {
                         TextField("分类名称（如：王者荣耀）", text: $newCategoryName)
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
@@ -1691,6 +1665,22 @@ struct StashView: View {
     }
 
     // MARK: - Reload
+
+    private static let collapsedKey = "shiliu.stashCollapsed"
+
+    private func loadCollapsed() {
+        let arr = UserDefaults.standard.stringArray(forKey: Self.collapsedKey) ?? []
+        collapsed = Set(arr)
+    }
+
+    private func toggleCollapsed(_ category: String) {
+        if collapsed.contains(category) {
+            collapsed.remove(category)
+        } else {
+            collapsed.insert(category)
+        }
+        UserDefaults.standard.set(Array(collapsed), forKey: Self.collapsedKey)
+    }
 
     private func reload() {
         // 按分类分组：子文件夹名 = 分类名；根目录插件 = 未分类；空分类也显示。
