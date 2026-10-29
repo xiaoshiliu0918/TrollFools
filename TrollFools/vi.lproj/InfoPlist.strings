@@ -1,1 +1,3 @@
-"CFBundleDisplayName" = "TrollFools";
+/* Rebranded: unified display name */
+"CFBundleDisplayName" = "石榴动态注入";
+"CFBundleName" = "石榴动态注入";

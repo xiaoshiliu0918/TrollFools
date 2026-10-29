@@ -309,3 +309,9 @@
 
 /* No comment provided by engineer. */
 "You’ve selected at least one Debian Package “%@”. We’re here to remind you that it will not work as it was in a jailbroken environment. Please make sure you know what you’re doing." = "你至少选择了一个 Debian 软件包 “%@”。请留意，它通常不会像在越狱环境当中那样工作，甚至完全不起作用。请确保你知道自己在做些什么。";
+
+/* TempInject */
+"TempInjectAndLaunch (%@)" = "临时注入并启动（%@）";
+"ChoosePlugInsAndTempInject" = "选择插件 · 临时注入并启动";
+"TempInjectSuccessHint" = "已临时注入并启动目标 App。\n退出目标 App 后会自动还原：重新打开目标 App 将不再加载插件。\n再次使用请回到本工具点击注入。";
+"TempInjectCLIMissing" = "未找到 trollfoolscli 组件，无法启动自动还原看门狗。";

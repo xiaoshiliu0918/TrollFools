@@ -309,3 +309,9 @@
 
 /* No comment provided by engineer. */
 "You’ve selected at least one Debian Package “%@”. We’re here to remind you that it will not work as it was in a jailbroken environment. Please make sure you know what you’re doing." = "You’ve selected at least one Debian Package “%@”. We’re here to remind you that it will not work as it was in a jailbroken environment. Please make sure you know what you’re doing.";
+
+/* TempInject */
+"TempInjectAndLaunch (%@)" = "Temp Inject & Launch (%@)";
+"ChoosePlugInsAndTempInject" = "Choose Plug-Ins · Temp Inject & Launch";
+"TempInjectSuccessHint" = "Temporarily injected and launched. The plug-in will be ejected automatically once the target app exits.\nRe-open the target app directly and it runs clean.\nUse this tool to inject again.";
+"TempInjectCLIMissing" = "trollfoolscli component not found, unable to start the auto-restore watchdog.";

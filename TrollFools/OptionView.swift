@@ -15,6 +15,10 @@ struct OptionView: View {
     @State var isImporterPresented = false
     @State var isImporterSelected = false
 
+    @State var isTempImporterPresented = false
+    @State var isTempInjectSelected = false
+    @State var pendingTempURLs: [URL] = []
+
     @State var isWarningPresented = false
     @State var temporaryResult: Result<[URL], any Error>?
 
@@ -96,8 +100,40 @@ struct OptionView: View {
                         : String(format: NSLocalizedString("Manage %d Plug-Ins", comment: ""), numberOfPlugIns)
                 )
 
-                Spacer()
+            Spacer()
+        }
+
+        VStack(spacing: 12) {
+            let rememberedURLs = TempInjectManager.shared.recordedPluginURLs(bid: app.bid)
+            if !rememberedURLs.isEmpty {
+                Button {
+                    pendingTempURLs = rememberedURLs
+                    isTempInjectSelected = true
+                } label: {
+                    Label(
+                        String(format: NSLocalizedString("TempInjectAndLaunch (%@)", comment: ""), rememberedURLs.map { $0.lastPathComponent }.joined(separator: ", ")),
+                        systemImage: "bolt.badge.clock"
+                    )
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.accentColor.opacity(0.18))
+                    .cornerRadius(8)
+                }
             }
+
+            Button {
+                isTempImporterPresented = true
+            } label: {
+                Label(NSLocalizedString("ChoosePlugInsAndTempInject", comment: ""), systemImage: "square.and.arrow.down.on.square")
+                    .font(.subheadline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.secondary.opacity(0.12))
+                    .cornerRadius(8)
+            }
+        }
+        .padding(.horizontal)
 
             if verticalSizeClass == .regular {
                 Button {
@@ -123,6 +159,13 @@ struct OptionView: View {
                             error: error
                         )
                     }
+                }
+            } label: { }
+
+            NavigationLink(isActive: $isTempInjectSelected) {
+                if !pendingTempURLs.isEmpty {
+                    InjectView(app, urlList: pendingTempURLs
+                        .sorted(by: { $0.lastPathComponent < $1.lastPathComponent }), tempMode: true)
                 }
             } label: { }
         })
@@ -155,6 +198,27 @@ struct OptionView: View {
             case .failure:
                 importerResult = result
                 isImporterSelected = true
+            }
+        }
+        .fileImporter(
+            isPresented: $isTempImporterPresented,
+            allowedContentTypes: [
+                .init(filenameExtension: "dylib")!,
+                .init(filenameExtension: "deb")!,
+                .bundle,
+                .framework,
+                .package,
+                .zip,
+            ],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case let .success(urls):
+                guard !urls.isEmpty else { return }
+                pendingTempURLs = urls
+                isTempInjectSelected = true
+            case .failure:
+                break
             }
         }
         .sheet(isPresented: $isSettingsPresented) {

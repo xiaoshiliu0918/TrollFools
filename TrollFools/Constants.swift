@@ -41,4 +41,7 @@ enum Constants {
     static let updateManagerAlertDelayDuration: TimeInterval = 60 * 60 * 24 * 7 // 1 week
     static let trollStoreIdentifier = "com.opa334.TrollStore"
     static let trollStoreInstallURLScheme = "apple-magnifier://install?url="
+
+    // TempInject: root of temporary injection session state
+    static let tempInjectRootURL = URL(fileURLWithPath: "/var/mobile/Library/TrollFools/TempInject")
 }

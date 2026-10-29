@@ -18,6 +18,7 @@ struct InjectView: View {
 
     let app: App
     let urlList: [URL]
+    let tempMode: Bool
 
     @State var injectResult: Result<SuccessPayload, Error>?
     @StateObject fileprivate var viewControllerHost = ViewControllerHost()
@@ -27,9 +28,10 @@ struct InjectView: View {
     @AppStorage var useFrameworkEnumerationFallback: Bool
     @AppStorage var injectStrategy: InjectorV3.Strategy
 
-    init(_ app: App, urlList: [URL]) {
+    init(_ app: App, urlList: [URL], tempMode: Bool = false) {
         self.app = app
         self.urlList = urlList
+        self.tempMode = tempMode
         _useWeakReference = AppStorage(wrappedValue: true, "UseWeakReference-\(app.bid)")
         _preferMainExecutable = AppStorage(wrappedValue: false, "PreferMainExecutable-\(app.bid)")
         _useFrameworkEnumerationFallback = AppStorage(wrappedValue: true, "UseFrameworkEnumerationFallback-\(app.bid)")
@@ -59,9 +61,11 @@ struct InjectView: View {
                 case let .success(payload):
                     SuccessView(
                         title: NSLocalizedString("Completed", comment: ""),
-                        subtitle: payload.didUseFallback
-                            ? NSLocalizedString("Completed with compatibility mode. The plug-in may start working after opening some app features.", comment: "")
-                            : nil,
+                        subtitle: tempMode
+                            ? NSLocalizedString("TempInjectSuccessHint", comment: "")
+                            : payload.didUseFallback
+                                ? NSLocalizedString("Completed with compatibility mode. The plug-in may start working after opening some app features.", comment: "")
+                                : nil,
                         logFileURL: payload.logFileURL
                     )
                     .onAppear {
@@ -137,7 +141,17 @@ struct InjectView: View {
             injector.useFrameworkEnumerationFallback = useFrameworkEnumerationFallback
             injector.injectStrategy = injectStrategy
 
-            try injector.inject(urlList, shouldPersist: true)
+            try injector.inject(urlList, shouldPersist: !tempMode)
+
+            if tempMode {
+                let manager = TempInjectManager.shared
+                try manager.writeState(bid: app.bid, assetURLs: urlList)
+                try manager.spawnWatchdog(bid: app.bid)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [bid = app.bid] in
+                    TempInjectManager.shared.launchApp(bid: bid)
+                }
+            }
+
             return .success(SuccessPayload(
                 logFileURL: injector.latestLogFileURL,
                 didUseFallback: injector.didUseMachOEnumerationFallback
@@ -157,6 +171,173 @@ struct InjectView: View {
             let nsErr = NSError(domain: Constants.gErrorDomain, code: 0, userInfo: userInfo)
 
             return .failure(nsErr)
+        }
+    }
+}
+
+// MARK: - TempInject Manager
+
+final class TempInjectManager {
+    static let shared = TempInjectManager()
+
+    private init() {}
+
+    private var stateRootURL: URL { Constants.tempInjectRootURL }
+
+    private func stateDirURL(for bid: String) -> URL {
+        stateRootURL.appendingPathComponent(bid, isDirectory: true)
+    }
+
+    private func stateFileURL(for bid: String) -> URL {
+        stateDirURL(for: bid).appendingPathComponent("state.json")
+    }
+
+    private func plugInListURL(for bid: String) -> URL {
+        stateDirURL(for: bid).appendingPathComponent("plugins.list")
+    }
+
+    private struct TempEntry: Codable {
+        let name: String
+        let kind: String
+    }
+
+    /// Record the temporary injection session state, and remember the chosen
+    /// plugin paths so that the next run can be one-tap.
+    func writeState(bid: String, assetURLs: [URL]) throws {
+        let fileManager = FileManager.default
+        let dirURL = stateDirURL(for: bid)
+        try fileManager.createDirectory(at: dirURL, withIntermediateDirectories: true)
+
+        let entries = assetURLs.map { url -> TempEntry in
+            let ext = url.pathExtension.lowercased()
+            let kind: String
+            switch ext {
+            case "bundle":
+                kind = "bundle" // copied to the app bundle root
+            case "framework":
+                kind = "framework" // copied to Frameworks/
+            default:
+                kind = "dylib" // copied to Frameworks/
+            }
+            return TempEntry(name: url.lastPathComponent, kind: kind)
+        }
+        let data = try JSONEncoder().encode(entries)
+        try data.write(to: stateFileURL(for: bid), options: .atomic)
+
+        let listContent = assetURLs.map { $0.path }.joined(separator: "\n")
+        try listContent.write(to: plugInListURL(for: bid), atomically: true, encoding: .utf8)
+    }
+
+    /// Plugins remembered from the last temporary injection, for one-tap reuse.
+    func recordedPluginURLs(bid: String) -> [URL] {
+        let fileManager = FileManager.default
+        guard let content = try? String(contentsOf: plugInListURL(for: bid), encoding: .utf8) else {
+            return []
+        }
+        return content
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { URL(fileURLWithPath: $0) }
+            .filter { fileManager.fileExists(atPath: $0.path) }
+    }
+
+    /// Locate the trollfoolscli binary shipped inside our own .app bundle.
+    static var cliBinaryURL: URL? {
+        let fileManager = FileManager.default
+        let ownBundleURL = Bundle.main.bundleURL.appendingPathComponent("trollfoolscli")
+        if fileManager.isExecutableFile(atPath: ownBundleURL.path) {
+            return ownBundleURL
+        }
+        if let proxy = LSApplicationProxy(forIdentifier: Constants.gAppIdentifier),
+           let bundleURL = proxy.bundleURL() {
+            let url = bundleURL.appendingPathComponent("trollfoolscli")
+            if fileManager.isExecutableFile(atPath: url.path) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    /// Spawn the detached watchdog (trollfoolscli watch). The watchdog survives
+    /// even if this app is suspended or killed by the user.
+    func spawnWatchdog(bid: String) throws {
+        guard let cliURL = Self.cliBinaryURL else {
+            throw NSError(
+                domain: Constants.gErrorDomain, code: -1,
+                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("TempInjectCLIMissing", comment: "")]
+            )
+        }
+        killWatchdog(bid: bid)
+        AuxiliaryExecute.spawn(
+            command: cliURL.path,
+            args: ["watch", bid],
+            completionBlock: nil
+        )
+    }
+
+    func killWatchdog(bid: String) {
+        let pidFileURL = stateDirURL(for: bid).appendingPathComponent("watchdog.pid")
+        guard let content = try? String(contentsOf: pidFileURL, encoding: .utf8) else {
+            return
+        }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let pid = pid_t(trimmed), pid > 1 else {
+            return
+        }
+        kill(pid, SIGKILL)
+        try? FileManager.default.removeItem(at: pidFileURL)
+    }
+
+    /// Jump to the target app via SpringBoard.
+    @discardableResult
+    func launchApp(bid: String) -> Bool {
+        LSApplicationWorkspace.default().openApplication(withBundleID: bid)
+    }
+
+    /// On app start: restore orphan sessions whose watchdog has died,
+    /// so temporary injections never outlive their session.
+    func cleanupOrphans() {
+        let fileManager = FileManager.default
+        guard let dirURLs = try? fileManager.contentsOfDirectory(
+            at: stateRootURL,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) else {
+            return
+        }
+        for dirURL in dirURLs {
+            guard (try? dirURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else {
+                continue
+            }
+            let bid = dirURL.lastPathComponent
+
+            // watchdog still alive? leave everything to it
+            let pidFileURL = dirURL.appendingPathComponent("watchdog.pid")
+            if let content = try? String(contentsOf: pidFileURL, encoding: .utf8) {
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let pid = pid_t(trimmed), pid > 1, kill(pid, 0) == 0 {
+                    continue
+                }
+            }
+
+            // no session state? just clean the folder
+            guard fileManager.fileExists(atPath: dirURL.appendingPathComponent("state.json").path) else {
+                try? fileManager.removeItem(at: dirURL)
+                continue
+            }
+
+            // watchdog died without restoring: restore synchronously via CLI.
+            // IMPORTANT: use the *blocking* spawn variant (waits via semaphore),
+            // otherwise removing state.json below races the CLI startup and the
+            // targeted restore degrades into a destructive ejectAll.
+            if let cliURL = Self.cliBinaryURL {
+                _ = AuxiliaryExecute.spawn(
+                    command: cliURL.path,
+                    args: ["watch", bid, "--timeout", "0"],
+                    timeout: 300
+                )
+            }
+            try? fileManager.removeItem(at: dirURL)
         }
     }
 }
